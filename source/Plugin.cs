@@ -54,6 +54,25 @@ namespace SwagSpawnStation
         }
         private Dictionary<GameObject, TransformData> _stationaryPuppets = new Dictionary<GameObject, TransformData>();
 
+        // Dropped Object Spawner instances are independent of the normal puppet refresh lifecycle.
+        private readonly List<GameObject> _droppedObjects = new List<GameObject>();
+
+        // Keep loaded prefab templates in memory so repeated refreshes/drops do not reread bundle files.
+        private sealed class CachedBundleAssets
+        {
+            public long FileLength;
+            public DateTime LastWriteTimeUtc;
+            public GameObject[] Prefabs;
+        }
+        private readonly Dictionary<string, CachedBundleAssets> _prefabCache = new Dictionary<string, CachedBundleAssets>(StringComparer.OrdinalIgnoreCase);
+
+        // Configuration Manager custom drawer metadata for the DELETE LAST OBJECT config entry.
+        private sealed class ConfigurationManagerAttributes
+        {
+            public Action<ConfigEntryBase> CustomDrawer;
+            public bool? HideDefaultButton;
+        }
+
         // Reflection
         private FieldInfo _characterVisualField;
         private FieldInfo _phoneActiveField;
@@ -75,6 +94,9 @@ namespace SwagSpawnStation
         public ConfigEntry<bool> BlockShieldBashKnockback;
 
         public ConfigEntry<bool> ObjectSpawnerEnabled;
+        public ConfigEntry<bool> DroppableObjectModeEnabled;
+        public ConfigEntry<KeyCode> DropObjectModeKey;
+        private ConfigEntry<bool> DeleteLastObjectButton;
         public ConfigEntry<string> ObjectSpawnerFolderName;
         public ConfigEntry<float> ObjectSpawnerRotX, ObjectSpawnerRotY, ObjectSpawnerRotZ;
         public ConfigEntry<float> ObjectSpawnerPosX, ObjectSpawnerPosY, ObjectSpawnerPosZ;
@@ -154,6 +176,7 @@ namespace SwagSpawnStation
         private string _lastLoadedMoveStyleBoost = "";
 
         private bool _lastObjectSpawnerState = false;
+        private bool _lastDroppableObjectModeState = false;
         private bool _lastStaticState = false;
         private bool _lastStatic2State = false;
         private bool _lastPhoneState = false;
@@ -202,6 +225,11 @@ namespace SwagSpawnStation
             BlockShieldBashKnockback = Config.Bind("1. General", "Block Shield Bash Knockback", false, "Prevents the shield bash knockback animation when hitting a shield cop (useful for ranged custom hitboxes).");
 
             ObjectSpawnerEnabled = Config.Bind("2. Object Spawner", "Enable Object Spawner", false, "Load objects that spawn at the player position but remain independent.");
+            DroppableObjectModeEnabled = Config.Bind("2. Object Spawner", "Enable Droppable Object Mode", false, "Allow the Drop Object Mode key to leave additional Object Spawner copies in the world. This can work independently of the automatic Object Spawner toggle.");
+            DropObjectModeKey = Config.Bind("2. Object Spawner", "Drop Object Mode", KeyCode.Keypad9, "Key to drop another copy of every loaded Object Spawner asset at the player's current visual position.");
+            DeleteLastObjectButton = Config.Bind("2. Object Spawner", "Delete Last Object", false,
+                new ConfigDescription("Click this button to delete the last object dropped with Drop Object Mode.", null,
+                    new ConfigurationManagerAttributes { CustomDrawer = DrawDeleteLastObjectButton, HideDefaultButton = true }));
             ObjectSpawnerFolderName = Config.Bind("2. Object Spawner", "Object Spawner Folder", "ObjectSpawner", "Folder for Object Spawner assets.");
             ObjectSpawnerRotX = Config.Bind("2. Object Spawner", "Rotation X", 0f, "Adjust X axis Rotation Pitch.");
             ObjectSpawnerRotY = Config.Bind("2. Object Spawner", "Rotation Y", 0f, "Adjust Y axis Rotation Pitch.");
@@ -356,6 +384,19 @@ namespace SwagSpawnStation
 
         private void Update()
         {
+            if (_droppedObjects.Count > 0)
+            {
+                for (int i = _droppedObjects.Count - 1; i >= 0; i--)
+                {
+                    if (_droppedObjects[i] == null) _droppedObjects.RemoveAt(i);
+                }
+            }
+
+            if (IsEnabled.Value && DroppableObjectModeEnabled.Value && Input.GetKeyDown(DropObjectModeKey.Value))
+            {
+                DropObjectsAtPlayerPosition();
+            }
+
             if (ManualToggleEnabled.Value)
             {
                 if (ManualHoldEnabled.Value)
@@ -465,7 +506,7 @@ namespace SwagSpawnStation
             _baseBundlesFolder = EffectsBundlesLocation.Value;
             _prefabCategoryMap.Clear();
 
-            if (ObjectSpawnerEnabled.Value) LoadBundlesIntoCategory(ObjectSpawnerFolderName.Value, EffectCategory.ObjectSpawner);
+            if (ObjectSpawnerEnabled.Value || DroppableObjectModeEnabled.Value) LoadBundlesIntoCategory(ObjectSpawnerFolderName.Value, EffectCategory.ObjectSpawner);
             if (StaticEnabled.Value) LoadBundlesIntoCategory(StaticFolderName.Value, EffectCategory.Static);
             if (Static2Enabled.Value) LoadBundlesIntoCategory(Static2FolderName.Value, EffectCategory.Static2);
             if (PhoneEnabled.Value) LoadBundlesIntoCategory(PhoneFolderName.Value, EffectCategory.Phone);
@@ -485,6 +526,7 @@ namespace SwagSpawnStation
             _lastLoadedMoveStyleBoost = MoveStyleBoostFolderName.Value;
 
             _lastObjectSpawnerState = ObjectSpawnerEnabled.Value;
+            _lastDroppableObjectModeState = DroppableObjectModeEnabled.Value;
             _lastStaticState = StaticEnabled.Value;
             _lastStatic2State = Static2Enabled.Value;
             _lastPhoneState = PhoneEnabled.Value;
@@ -550,18 +592,37 @@ namespace SwagSpawnStation
             {
                 foreach (var file in Directory.GetFiles(targetPath, "*.cbb", SearchOption.TopDirectoryOnly))
                 {
-                    AssetBundle bundle = AssetBundle.LoadFromFile(file);
-                    if (bundle == null) continue;
+                    string cacheKey = Path.GetFullPath(file);
+                    FileInfo fileInfo = new FileInfo(file);
+                    CachedBundleAssets cachedAssets;
 
-                    var assets = bundle.LoadAllAssets<GameObject>();
-                    foreach (var go in assets)
+                    bool cacheIsCurrent = _prefabCache.TryGetValue(cacheKey, out cachedAssets) &&
+                        cachedAssets != null && cachedAssets.Prefabs != null &&
+                        cachedAssets.FileLength == fileInfo.Length &&
+                        cachedAssets.LastWriteTimeUtc == fileInfo.LastWriteTimeUtc;
+
+                    if (!cacheIsCurrent)
                     {
-                        if (!_prefabCategoryMap.ContainsKey(go))
+                        AssetBundle bundle = AssetBundle.LoadFromFile(file);
+                        if (bundle == null) continue;
+
+                        GameObject[] assets = bundle.LoadAllAssets<GameObject>();
+                        bundle.Unload(false);
+
+                        cachedAssets = new CachedBundleAssets
                         {
-                            _prefabCategoryMap.Add(go, category);
-                        }
+                            FileLength = fileInfo.Length,
+                            LastWriteTimeUtc = fileInfo.LastWriteTimeUtc,
+                            Prefabs = assets
+                        };
+                        _prefabCache[cacheKey] = cachedAssets;
                     }
-                    bundle.Unload(false);
+
+                    foreach (var go in cachedAssets.Prefabs)
+                    {
+                        if (go != null && !_prefabCategoryMap.ContainsKey(go))
+                            _prefabCategoryMap.Add(go, category);
+                    }
                 }
             }
         }
@@ -616,6 +677,7 @@ namespace SwagSpawnStation
 
             bool stateChanged =
                 ObjectSpawnerEnabled.Value != _lastObjectSpawnerState ||
+                DroppableObjectModeEnabled.Value != _lastDroppableObjectModeState ||
                 StaticEnabled.Value != _lastStaticState ||
                 Static2Enabled.Value != _lastStatic2State ||
                 PhoneEnabled.Value != _lastPhoneState ||
@@ -756,6 +818,13 @@ namespace SwagSpawnStation
 
                 if (prefab == null) continue;
 
+                if (category == EffectCategory.ObjectSpawner)
+                {
+                    if (ObjectSpawnerEnabled.Value)
+                        CreateObjectSpawnerInstance(prefab, playerVisual, false, ref syncRefreshNeeded);
+                    continue;
+                }
+
                 GameObject puppet = Instantiate(prefab);
                 puppet.name = $"{prefab.name}_{category}_StationPuppet";
                 puppet.transform.position = playerVisual.position;
@@ -798,65 +867,179 @@ namespace SwagSpawnStation
                     }
                 }
 
-                if (category == EffectCategory.ObjectSpawner)
-                {
-                    MapBonesRecursive(puppet.transform, playerVisual, oneShot: true, category);
-                }
-                else
-                {
-                    MapBonesRecursive(puppet.transform, playerVisual, oneShot: false, category);
-                }
+                MapBonesRecursive(puppet.transform, playerVisual, oneShot: false, category);
 
                 if (hitboxCount > 0)
                 {
                     puppet.transform.SetParent(playerVisual, false);
                     Logger.LogInfo($"[Hitbox Bridge] Registered {hitboxCount} custom hitboxes on '{prefab.name}'. Parented to Player.");
-                    if (category == EffectCategory.ObjectSpawner)
-                    {
-                        _stationaryPuppets[puppet] = new TransformData(puppet.transform.position, puppet.transform.rotation);
-                    }
                 }
 
-                if (tvTransforms.Count > 0)
-                {
-                    foreach (var tvTransform in tvTransforms)
-                    {
-                        Logger.LogInfo($"[SyncVideo Bridge] Found TV prop on '{prefab.name}'. Renaming exactly to 'TV' and injecting scripts...");
-                        tvTransform.name = "TV";
-                        tvTransform.gameObject.layer = 21;
-                        syncRefreshNeeded = true;
-
-                        if (tvTransform.GetComponent<MeshRenderer>() == null)
-                        {
-                            Logger.LogWarning("[SyncVideo Bridge] WARNING: 'TV' object does not have a MeshRenderer!");
-                        }
-
-                        try
-                        {
-                            Type junkType = Type.GetType("Reptile.Junk, Assembly-CSharp");
-                            if (junkType != null && tvTransform.gameObject.GetComponent(junkType) == null)
-                            {
-                                tvTransform.gameObject.AddComponent(junkType);
-                            }
-
-                            Type stageObjectType = Type.GetType("MapStation.Common.StageObject, MapStation.Common");
-                            if (stageObjectType != null && tvTransform.gameObject.GetComponent(stageObjectType) == null)
-                            {
-                                tvTransform.gameObject.AddComponent(stageObjectType);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogWarning($"[SyncVideo Bridge] Failed to inject components via reflection: {ex.Message}");
-                        }
-                    }
-                }
+                ConfigureTVProps(tvTransforms, prefab.name, ref syncRefreshNeeded);
             }
 
             if (syncRefreshNeeded)
             {
                 TryForceSyncVideoRefresh();
             }
+        }
+
+        // Shared ObjectSpawner clone path. Both the original Enable Object Spawner behavior and
+        // hotkey drops use the same placement, asset setup, one-shot bone placement, and integrations.
+        // Dropped copies deliberately stay unparented so they remain at their captured world transform.
+        private GameObject CreateObjectSpawnerInstance(GameObject prefab, Transform playerVisual, bool dropped, ref bool syncRefreshNeeded)
+        {
+            if (prefab == null || playerVisual == null) return null;
+
+            GameObject puppet = Instantiate(prefab);
+            puppet.name = dropped ? $"{prefab.name}_ObjectSpawner_Dropped" : $"{prefab.name}_ObjectSpawner_StationPuppet";
+            puppet.transform.position = playerVisual.position;
+            puppet.transform.rotation = playerVisual.rotation;
+            puppet.transform.localScale = Vector3.one;
+
+            InjectGrinds(puppet);
+            InjectAmbientTriggers(puppet);
+            TeleporterSetup.SetupTeleportersInHierarchy(puppet.transform);
+
+            var allChildren = puppet.GetComponentsInChildren<Transform>(true).ToList();
+            bool hasAuthKey = false;
+            List<Transform> tvTransforms = new List<Transform>();
+
+            foreach (var child in allChildren)
+            {
+                if (child.name.Equals("AuthKey", StringComparison.OrdinalIgnoreCase)) hasAuthKey = true;
+                if (child.name.Contains("TV")) tvTransforms.Add(child);
+            }
+
+            if (!hasAuthKey)
+            {
+                DestroyImmediate(puppet);
+                return null;
+            }
+
+            if (!dropped)
+            {
+                _activePuppets.Add(puppet);
+                _puppetCategoryMap[puppet] = EffectCategory.ObjectSpawner;
+                _puppetStateCache[puppet] = false;
+            }
+            int hitboxCount = 0;
+            foreach (var col in puppet.GetComponentsInChildren<Collider>(true))
+            {
+                if (col.name.IndexOf("Hitbox", StringComparison.OrdinalIgnoreCase) >= 0 || col.gameObject.layer == 18)
+                {
+                    col.gameObject.layer = 18;
+                    col.isTrigger = true;
+                    hitboxCount++;
+                }
+            }
+
+            MapBonesRecursive(puppet.transform, playerVisual, oneShot: true, EffectCategory.ObjectSpawner);
+            if (hitboxCount > 0)
+            {
+                if (!dropped)
+                {
+                    puppet.transform.SetParent(playerVisual, false);
+                    _stationaryPuppets[puppet] = new TransformData(puppet.transform.position, puppet.transform.rotation);
+                    Logger.LogInfo($"[Hitbox Bridge] Registered {hitboxCount} custom hitboxes on '{prefab.name}'. Parented to Player.");
+                }
+                else
+                {
+                    Logger.LogInfo($"[Hitbox Bridge] Registered {hitboxCount} custom hitboxes on dropped object '{prefab.name}'. Kept independent in world.");
+                }
+            }
+
+            ConfigureTVProps(tvTransforms, prefab.name, ref syncRefreshNeeded);
+            if (dropped)
+            {
+                // Apply the same active-state initialization used by the regular ObjectSpawner puppet.
+                UpdateEffectState(puppet, true);
+                _puppetStateCache.Remove(puppet);
+                _droppedObjects.Add(puppet);
+            }
+
+            return puppet;
+        }
+
+        private void ConfigureTVProps(List<Transform> tvTransforms, string prefabName, ref bool syncRefreshNeeded)
+        {
+            foreach (var tvTransform in tvTransforms)
+            {
+                Logger.LogInfo($"[SyncVideo Bridge] Found TV prop on '{prefabName}'. Renaming exactly to 'TV' and injecting scripts...");
+                tvTransform.name = "TV";
+                tvTransform.gameObject.layer = 21;
+                syncRefreshNeeded = true;
+                if (tvTransform.GetComponent<MeshRenderer>() == null)
+                    Logger.LogWarning("[SyncVideo Bridge] WARNING: 'TV' object does not have a MeshRenderer!");
+                try
+                {
+                    Type junkType = Type.GetType("Reptile.Junk, Assembly-CSharp");
+                    if (junkType != null && tvTransform.gameObject.GetComponent(junkType) == null)
+                        tvTransform.gameObject.AddComponent(junkType);
+                    Type stageObjectType = Type.GetType("MapStation.Common.StageObject, MapStation.Common");
+                    if (stageObjectType != null && tvTransform.gameObject.GetComponent(stageObjectType) == null)
+                        tvTransform.gameObject.AddComponent(stageObjectType);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning($"[SyncVideo Bridge] Failed to inject components via reflection: {ex.Message}");
+                }
+            }
+        }
+
+        private void DropObjectsAtPlayerPosition()
+        {
+            if (!IsEnabled.Value || !DroppableObjectModeEnabled.Value) return;
+            Player player = WorldHandler.instance?.GetCurrentPlayer();
+            if (player == null) return;
+
+            object visualObj = _characterVisualField?.GetValue(player);
+            Transform playerVisual = visualObj != null ? ExtractTransform(visualObj) : null;
+            if (playerVisual == null) playerVisual = player.transform;
+            bool syncRefreshNeeded = false;
+            int droppedCount = 0;
+
+            // Each key press repeats the normal ObjectSpawner prefab pass, creating another set of copies.
+            foreach (var kvp in _prefabCategoryMap.ToList())
+            {
+                if (kvp.Value != EffectCategory.ObjectSpawner || kvp.Key == null) continue;
+                if (CreateObjectSpawnerInstance(kvp.Key, playerVisual, true, ref syncRefreshNeeded) != null)
+                    droppedCount++;
+            }
+            if (syncRefreshNeeded) TryForceSyncVideoRefresh();
+
+            if (droppedCount > 0)
+                Logger.LogInfo($"[SwagSpawnStation] Drop Object Mode created {droppedCount} object instance(s) at the player's current position. Total dropped: {_droppedObjects.Count}.");
+            else
+                Logger.LogWarning("[SwagSpawnStation] Drop Object Mode was pressed, but no valid Object Spawner assets are loaded. Enable Droppable Object Mode and check the Object Spawner folder.");
+        }
+
+        private void DrawDeleteLastObjectButton(ConfigEntryBase entry)
+        {
+            if (GUILayout.Button("DELETE LAST OBJECT", GUILayout.ExpandWidth(true)))
+                DeleteLastDroppedObject();
+        }
+
+        private void DeleteLastDroppedObject()
+        {
+            for (int i = _droppedObjects.Count - 1; i >= 0; i--)
+            {
+                GameObject lastObject = _droppedObjects[i];
+                _droppedObjects.RemoveAt(i);
+                if (lastObject == null) continue;
+                Destroy(lastObject);
+                Logger.LogInfo($"[SwagSpawnStation] Deleted last dropped object. Remaining dropped objects: {_droppedObjects.Count}.");
+                return;
+            }
+
+            Logger.LogInfo("[SwagSpawnStation] There are no dropped objects to delete.");
+        }
+
+        private void DeleteAllDroppedObjects()
+        {
+            foreach (GameObject droppedObject in _droppedObjects)
+                if (droppedObject != null) Destroy(droppedObject);
+            _droppedObjects.Clear();
         }
 
         private void InjectGrinds(GameObject root)
@@ -868,12 +1051,10 @@ namespace SwagSpawnStation
                 {
                     Transform nodesContainer = t.Find("Nodes");
                     Transform linesContainer = t.Find("Line") ?? t.Find("Lines");
-
                     if (nodesContainer == null || linesContainer == null) continue;
 
                     var grindPath = t.gameObject.GetComponent<GrindPath>();
                     if (grindPath == null) grindPath = t.gameObject.AddComponent<GrindPath>();
-
                     try
                     {
                         grindPath.sfxCollection = SfxCollectionID.GrindMetalSfx;
@@ -886,14 +1067,12 @@ namespace SwagSpawnStation
                         var node = nodeTransform.gameObject.AddComponent<GrindNode>();
                         node.PathReference = grindPath;
                         node.grindLines = new List<GrindLine>();
-
                         string name = nodeTransform.name.Replace(" ", "");
                         string numPart = new string(name.TakeWhile(char.IsDigit).ToArray());
                         if (int.TryParse(numPart, out int index))
                         {
                             nodeDict[index] = node;
                         }
-
                         if (name.IndexOf("Retour", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             node.retour = true;
@@ -904,7 +1083,6 @@ namespace SwagSpawnStation
                     {
                         string name = lineTransform.name.Replace(" ", "");
                         string numPart = new string(name.TakeWhile(char.IsDigit).ToArray());
-
                         if (int.TryParse(numPart, out int index))
                         {
                             var line = lineTransform.gameObject.AddComponent<GrindLine>();
@@ -921,14 +1099,12 @@ namespace SwagSpawnStation
                                 line.nodes[1] = n1;
                                 n0.grindLines.Add(line);
                                 n1.grindLines.Add(line);
-
                                 var col = lineTransform.gameObject.GetComponent<CapsuleCollider>();
                                 if (col == null) col = lineTransform.gameObject.AddComponent<CapsuleCollider>();
 
                                 float radius = 0.84f;
                                 col.radius = radius;
                                 col.direction = 2;
-
                                 Vector3 dirVector = n1.transform.position - n0.transform.position;
                                 float dist = dirVector.magnitude;
                                 lineTransform.position = n0.transform.position + (dirVector.normalized * (dist * 0.5f));
@@ -1621,6 +1797,8 @@ namespace SwagSpawnStation
             Application.onBeforeRender -= OnBeforeRender;
             _harmony?.UnpatchSelf();
             DestroyPuppets();
+            DeleteAllDroppedObjects();
+            _prefabCache.Clear();
         }
     }
 
