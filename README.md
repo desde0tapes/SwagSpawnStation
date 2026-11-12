@@ -4,3 +4,4 @@
 
 AssetBundle spawner for BRC character gameplay
 
+It's exactly like SwagSpawn but exclusively has MapStation scripts to achieve more than visual effects: Grinds, Ambient Triggers, SyncVideo objects, Player Hitboxes (collides with game) and Teleports!
